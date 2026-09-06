@@ -1,0 +1,170 @@
+# =========================================
+# 0. 설치
+# =========================================
+%pip install -q \
+    "diffusers==0.32.0" \
+    "transformers==4.47.1" \
+    "accelerate>=0.31.0" \
+    "safetensors>=0.3.1"
+
+# =========================================
+# 1. 모델 로드
+# =========================================
+import torch
+from diffusers import StableDiffusionPipeline
+from tqdm.auto import tqdm
+from PIL import Image
+import numpy as np
+import os
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("device:", device)
+
+model_id = "Manojb/stable-diffusion-2-base"
+
+pipe = StableDiffusionPipeline.from_pretrained(
+    model_id,
+    torch_dtype=torch.float16,
+    use_safetensors=True,
+).to(device)
+
+pipe.enable_attention_slicing()
+pipe.enable_vae_slicing()
+
+tokenizer    = pipe.tokenizer
+text_encoder = pipe.text_encoder
+unet         = pipe.unet
+vae          = pipe.vae
+scheduler    = pipe.scheduler
+
+unet_dtype = next(unet.parameters()).dtype
+print("UNet dtype:", unet_dtype)
+
+
+# =========================================
+# 2. 텍스트 인코딩
+# =========================================
+@torch.no_grad()
+def encode(p):
+    ids = tokenizer(
+        [p],
+        padding="max_length",
+        max_length=tokenizer.model_max_length,
+        truncation=True,
+        return_tensors="pt",
+    ).input_ids.to(device)
+    return text_encoder(ids)[0].to(device=device, dtype=unet_dtype)
+
+
+# =========================================
+# 3. 계절별 프롬프트 설정
+# =========================================
+prompt_spring = (
+    "early spring river landscape, blooming cherry blossoms, fresh bright green leaves, "
+    "soft morning sunlight, gentle pastel tones, warm and lively atmosphere"
+)
+prompt_summer = (
+    "mid-summer river and dense green forest, vibrant saturated colors, "
+    "strong sunlight, deep blue sky, high contrast, energetic warm weather"
+)
+prompt_autumn = (
+    "autumn mountains and winding river, vivid orange and red foliage, "
+    "golden hour lighting, warm dramatic atmosphere, crisp and colorful"
+)
+prompt_winter = (
+    "winter mountain valley with snow-covered trees, frozen river, "
+    "cold blue ambient light, clear frosty air, serene and quiet mood"
+)
+
+prompts = [prompt_spring, prompt_summer, prompt_autumn, prompt_winter]
+
+emb_uncond = encode(
+    "no border, no frame, no collage, no split screen, no white line, no hard separation"
+)
+emb_conds  = [encode(p) for p in prompts]
+
+
+# =========================================
+# 4. Latent 공간 가로 확장 + Soft mask
+# =========================================
+PANO_RATIO = 3.0
+
+latent_h = unet.config.sample_size       # 64
+latent_w = int(unet.config.sample_size * PANO_RATIO)  # 192
+print("latent:", latent_h, latent_w)
+
+ys = torch.linspace(0, 1, latent_h, device=device, dtype=unet_dtype)
+xs = torch.linspace(0, 1, latent_w, device=device, dtype=unet_dtype)
+yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+
+K = 4
+centers = [(i + 0.5) / K for i in range(K)]
+sigma = 0.15   # sigma = 계절별 차이 강도
+
+logits = []
+for cx in centers:
+    logits.append(-((xx - cx) ** 2) / (2 * sigma * sigma))
+
+weights = torch.softmax(torch.stack(logits, dim=0), dim=0)
+masks = [weights[i].unsqueeze(0).unsqueeze(0) for i in range(K)]
+
+
+# =========================================
+# 5. 초기 latent + 스케줄러
+# =========================================
+scheduler.set_timesteps(30, device=device)
+timesteps = scheduler.timesteps
+
+latents = torch.randn(
+    (1, unet.config.in_channels, latent_h, latent_w),
+    device=device,
+    dtype=unet_dtype,
+    generator=torch.Generator(device=device).manual_seed(2025),
+)
+
+
+# =========================================
+# 6. Sampling (Season blending)
+# =========================================
+with torch.no_grad():
+    for i, t in enumerate(tqdm(timesteps)):
+        s = i / (len(timesteps) - 1)
+
+        noise_preds = []
+
+        for k in range(K):
+            emb_cond = emb_conds[k]
+
+            latent_input = torch.cat([latents, latents], dim=0)
+            text_embeds  = torch.cat([emb_uncond, emb_cond], dim=0)
+
+            noise = unet(latent_input, t, encoder_hidden_states=text_embeds).sample
+            n_uncond, n_cond = noise.chunk(2, dim=0)
+
+            cfg = 9.0 + 3.0 * s  
+            n = n_uncond + cfg * (n_cond - n_uncond)
+
+            noise_preds.append(n)
+
+        # Soft blending over x-axis
+        noise_mix = torch.zeros_like(latents)
+        for k in range(K):
+            noise_mix += noise_preds[k] * masks[k]
+
+        latents = scheduler.step(noise_mix, t, latents).prev_sample
+
+
+# =========================================
+# 7. 디코딩
+# =========================================
+with torch.no_grad():
+    img = vae.decode(latents / vae.config.scaling_factor).sample
+    img = (img.clamp(-1, 1) + 1) / 2
+    img = img[0].cpu().permute(1, 2, 0).numpy()
+    img_uint8 = (img * 255).astype("uint8")
+
+os.makedirs("outputs", exist_ok=True)
+path = "outputs/panorama_4seasons.png"
+Image.fromarray(img_uint8).save(path)
+
+path
